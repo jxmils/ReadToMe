@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ReadToMe</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <button id="brandBtn" class="brand-btn" title="Back to start">
+        <span class="brand-icon" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path>
+            <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path>
+          </svg>
+        </span>
+        <span class="brand-name">ReadToMe</span>
+      </button>
+      <div id="localStatusBadge" class="status-pill" title="Running locally on your machine">
+        <span class="status-dot"></span>
+        <span id="localStatusText">Starting local models...</span>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <button id="newDocBtn" class="btn btn-ghost hidden">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        New PDF or text
+      </button>
+      <button id="themeToggleBtn" class="icon-btn" title="Switch light / dark theme" aria-label="Switch theme">
+        <svg id="themeIconSun" class="hidden" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <svg id="themeIconMoon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="ingestView" class="ingest-view">
+    <section class="hero-header">
+      <div class="eyebrow">Local Paper &amp; Text Reader</div>
+      <h1>Read any paper out loud, figures included.</h1>
+      <p class="hero-sub">
+        Upload a PDF or paste text. It keeps two-column papers in the right order, cleans up citations, and tells you what each chart or diagram shows instead of skipping over it.
+      </p>
+    </section>
+
+    <section class="ingest-grid">
+      <div class="ingest-card">
+        <div class="card-header-row">
+          <h2>Upload a PDF</h2>
+          <span class="pill-tag">Figures + 2-column</span>
+        </div>
+        <div id="pdfDropzone" class="dropzone" tabindex="0" role="button" aria-label="Upload PDF file">
+          <input id="pdfFileInput" type="file" accept=".pdf,application/pdf" hidden />
+          <div class="dropzone-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <path d="M12 18v-6"></path>
+              <path d="m9 15 3-3 3 3"></path>
+            </svg>
+          </div>
+          <div class="dropzone-title">Drop a PDF here or <span class="link-accent">choose a file</span></div>
+          <div class="dropzone-hint">Pulls out text and figures and reads them in order</div>
+        </div>
+
+        <div class="sample-row">
+          <button id="loadSampleBtn" class="btn btn-secondary full-width">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            Try the sample paper
+          </button>
+        </div>
+      </div>
+
+      <div class="ingest-card">
+        <div class="card-header-row">
+          <h2>Paste text</h2>
+          <button id="fillSampleTextBtn" class="text-btn">Use sample text</button>
+        </div>
+        <input id="pasteTitleInput" class="input-field" type="text" placeholder="Title (optional)" />
+        <textarea
+          id="pasteTextInput"
+          class="textarea-field"
+          rows="7"
+          placeholder="Paste paper sections, abstracts, or notes here..."
+        ></textarea>
+        <button id="submitTextBtn" class="btn btn-primary full-width">
+          Read out loud
+        </button>
+      </div>
+    </section>
+
+    <div class="ingest-options-bar">
+      <label class="checkbox-label">
+        <input type="checkbox" id="stripCitationsCheck" checked />
+        <span>Skip inline citation numbers like <code>[1, 4, 12]</code> and read math symbols (<code>α</code>, <code>3.4×</code>, <code>±</code>) as words</span>
+      </label>
+    </div>
+
+    <div id="ingestBusyBanner" class="busy-banner hidden">
+      <div class="spinner"></div>
+      <span id="ingestBusyText">Reading PDF and pulling out figures...</span>
+    </div>
+
+    <section id="recentSection" class="recent-section hidden">
+      <h3>Recent documents</h3>
+      <div id="recentList" class="recent-grid"></div>
+    </section>
+  </main>
+
+  <div id="readerView" class="reader-layout hidden">
+    <aside class="sidebar">
+      <div class="doc-meta-box">
+        <div id="docSourceBadge" class="doc-badge">PDF</div>
+        <h2 id="sidebarDocTitle" class="sidebar-doc-title">Document</h2>
+        <div id="sidebarDocStats" class="sidebar-doc-stats"></div>
+      </div>
+
+      <div class="sidebar-group">
+        <div class="sidebar-heading">Settings</div>
+        <label class="toggle-row">
+          <span>Describe figures</span>
+          <input type="checkbox" id="explainFiguresToggle" checked />
+        </label>
+        <label class="toggle-row" title="Switch to a second voice when describing figures">
+          <span>Different voice for figures</span>
+          <input type="checkbox" id="distinctFigureVoiceToggle" checked />
+        </label>
+        <label class="toggle-row">
+          <span>Read references at the end</span>
+          <input type="checkbox" id="readReferencesToggle" />
+        </label>
+      </div>
+
+      <div id="sidebarFiguresGroup" class="sidebar-group hidden">
+        <div class="sidebar-heading">
+          <span>Figures</span>
+          <span id="figureReadyCounter" class="counter-pill">0 / 0</span>
+        </div>
+        <div id="sidebarFiguresList" class="sidebar-figures-list"></div>
+      </div>
+
+      <div class="sidebar-group outline-group">
+        <div class="sidebar-heading">Sections</div>
+        <nav id="sidebarOutlineList" class="outline-list"></nav>
+      </div>
+    </aside>
+
+    <section id="readingCanvas" class="reading-canvas">
+      <div id="segmentsContainer" class="segments-container"></div>
+    </section>
+  </div>
+
+  <footer id="playerDock" class="player-dock hidden">
+    <div class="player-inner">
+      <div class="transport-controls">
+        <button id="prevSegBtn" class="icon-btn" title="Previous (Left Arrow)" aria-label="Previous">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"></path>
+          </svg>
+        </button>
+        <button id="playPauseBtn" class="play-btn" title="Play / Pause (Space)" aria-label="Play or Pause">
+          <svg id="playIcon" width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="6 4 20 12 6 20 6 4"></polygon>
+          </svg>
+          <svg id="pauseIcon" class="hidden" width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="6" y="4" width="4" height="16" rx="1"></rect>
+            <rect x="14" y="4" width="4" height="16" rx="1"></rect>
+          </svg>
+        </button>
+        <button id="nextSegBtn" class="icon-btn" title="Next (Right Arrow)" aria-label="Next">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"></path>
+          </svg>
+        </button>
+      </div>
+
+      <div class="now-playing-info">
+        <div class="now-playing-top">
+          <span id="nowPlayingBadge" class="np-badge">READY</span>
+          <span id="nowPlayingLabel" class="np-label">Press Play or click any paragraph or figure</span>
+          <span id="nowPlayingProgress" class="np-counter">0 / 0</span>
+        </div>
+        <div class="progress-track" id="docProgressTrack" title="Progress">
+          <div id="docProgressFill" class="progress-fill"></div>
+        </div>
+      </div>
+
+      <div class="voice-speed-controls">
+        <div class="control-pill">
+          <label for="voiceSelect">Voice</label>
+          <select id="voiceSelect" class="compact-select"></select>
+        </div>
+        <div class="control-pill">
+          <label for="speedSelect">Speed</label>
+          <select id="speedSelect" class="compact-select">
+            <option value="0.85">0.85x</option>
+            <option value="1" selected>1.0x</option>
+            <option value="1.15">1.15x</option>
+            <option value="1.25">1.25x</option>
+            <option value="1.4">1.4x</option>
+            <option value="1.6">1.6x</option>
+            <option value="1.85">1.85x</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <div id="figureLightbox" class="lightbox hidden" role="dialog" aria-modal="true">
+    <button id="closeLightboxBtn" class="lightbox-close" aria-label="Close">&times;</button>
+    <img id="lightboxImg" src="" alt="Figure preview" />
+    <div id="lightboxCaption" class="lightbox-caption"></div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
