@@ -11,36 +11,38 @@ import pymupdf
 from .models import DocumentSession, Segment
 from .speech_cleaner import clean_display_text, prepare_spoken_text
 
-# Matches actual figure captions like "Figure 1: ...", "Fig. 2. ...", "FIGURE 3 — ..."
-_CAPTION_START_RE = re.compile(
+_FIG_CAPTION_RE = re.compile(
     r"^\s*(?:Figure|Fig\.?|FIGURE|FIG\.?)\s*(\d+[A-Za-z]?)\s*(?:[:.|—–\-]|\s+(?=[A-Z(]))",
     re.DOTALL,
 )
-# Body sentences starting with "Figure 1 shows..." (no punctuation separator + lowercase verb)
+_TABLE_CAPTION_RE = re.compile(
+    r"^\s*(?:Table|Tab\.?|TABLE)\s*(\d+[A-Za-z]?|[IVX]+)\s*(?:[:.|—–\-]|\s+(?=[A-Z(]))",
+    re.DOTALL,
+)
 _FALSE_CAPTION_VERB_RE = re.compile(
-    r"^\s*(?:Figure|Fig\.?)\s*\d+[A-Za-z]?\s+"
-    r"(?:shows?|illustrates?|demonstrates?|presents?|compares?|depicts?|plots?|"
+    r"^\s*(?:Figure|Fig\.?|Table|Tab\.?)\s*(?:\d+[A-Za-z]?|[IVX]+)\s+"
+    r"(?:shows?|illustrates?|demonstrates?|presents?|compares?|depicts?|plots?|lists?|"
     r"summarizes?|is|are|was|were|reveals?|highlights?|confirms?|provides?|gives?|reports?)\b",
     re.IGNORECASE,
 )
-_TABLE_CAPTION_RE = re.compile(r"^\s*(?:Table|Tab\.?|TABLE)\s*(?:\d+|[IVX]+)\b")
 
 _SECTION_HEADING_RE = re.compile(
     r"^(?:(?:\d+(?:\.\d+){0,2}|[IVX]+\.)\s+[A-Z][^\n]{1,75}|"
     r"(?:Abstract|Introduction|Background|Related\s+Work|Preliminaries|Method(?:s|ology)?|"
-    r"Approach|Architecture|Experiments?|Experimental\s+Setup|Results?(?:\s+and\s+Discussion)?|"
-    r"Discussion|Ablation\s+Stud(?:y|ies)|Limitations?|Conclusion(?:s)?|Acknowledg(?:e)?ments?|"
-    r"Appendix|References|Bibliography))$",
+    r"Approach|Architecture|Performance\s+Evaluation|Experiments?|Experimental\s+Setup|"
+    r"Results?(?:\s+and\s+Discussion)?|Discussion|Ablation\s+Stud(?:y|ies)|Limitations?|"
+    r"Conclusion(?:s)?|Acknowledg(?:e)?ments?|Appendix|References|Bibliography))$",
     re.IGNORECASE,
 )
 
 _REFERENCES_HEADING_RE = re.compile(r"^(?:\d+\.?\s*)?(?:References|Bibliography|Works\s+Cited)$", re.IGNORECASE)
 _ARXIV_STAMP_RE = re.compile(r"arXiv:\d{4}\.\d{4,5}", re.IGNORECASE)
+_DOI_HEADER_RE = re.compile(r"^DOI:\s*10\.\d{4,9}/\S+$", re.IGNORECASE)
 
 
 @dataclass
 class _TextBlock:
-    page_num: int  # 1-based
+    page_num: int
     bbox: pymupdf.Rect
     raw_text: str
     clean_text: str
@@ -53,6 +55,7 @@ class _TextBlock:
 @dataclass
 class _ExtractedFigure:
     figure_id: str
+    kind_name: str  # "Figure" or "Table"
     figure_num: str | None
     figure_label: str
     page_num: int
@@ -96,7 +99,7 @@ def _separated_by_barrier(a: pymupdf.Rect, b: pymupdf.Rect, barriers: list[pymup
 
 
 def _merge_visual_boxes(boxes: list[pymupdf.Rect], barriers: list[pymupdf.Rect]) -> list[pymupdf.Rect]:
-    """Merge nearby sub-panels/drawings belonging to the same figure unless a caption separates them."""
+    """Merge overlapping or tightly touching visual sub-elements without crossing column gutters or captions."""
     if not boxes:
         return []
     merged = [pymupdf.Rect(b) for b in boxes]
@@ -115,8 +118,8 @@ def _merge_visual_boxes(boxes: list[pymupdf.Rect], barriers: list[pymupdf.Rect])
                 other = merged[j]
                 if _separated_by_barrier(cur, other, barriers):
                     continue
-                # Check intersection or close proximity (side-by-side panels or stacked subplots)
-                expanded = pymupdf.Rect(cur.x0 - 26, cur.y0 - 20, cur.x1 + 26, cur.y1 + 20)
+                # Keep horizontal merge tight (7pt) so figures in adjacent 2/3-col columns stay separate
+                expanded = pymupdf.Rect(cur.x0 - 7, cur.y0 - 12, cur.x1 + 7, cur.y1 + 12)
                 if not (expanded & other).is_empty:
                     cur |= other
                     used[j] = True
@@ -148,27 +151,63 @@ def _extract_page_text_blocks(page: pymupdf.Page, page_num: int) -> list[_TextBl
         saw_first_span = False
 
         for line in b.get("lines", []):
+            spans = line.get("spans", [])
+            line_max_sz = max((float(s.get("size", 10.0)) for s in spans if s.get("text", "").strip()), default=10.0)
             span_strs: list[str] = []
-            for span in line.get("spans", []):
+            prev_nonempty_txt = ""
+            prev_origin_y: float | None = None
+
+            for span in spans:
                 txt = span.get("text", "")
                 if not txt.strip():
                     if txt:
                         span_strs.append(txt)
                     continue
-                span_strs.append(txt)
+
                 sz = float(span.get("size", 10.0))
-                font_name = span.get("font", "").lower()
                 flags = int(span.get("flags", 0))
-                is_span_bold = bool(flags & 16) or ("bold" in font_name) or ("medi" in font_name) or ("demi" in font_name)
+                origin = span.get("origin")
+                origin_y = float(origin[1]) if origin and len(origin) >= 2 else None
+                stripped_t = txt.strip()
+
+                # Detect superscript numeric citations (e.g. "Law.17", "weights.27,29", "studies5")
+                is_sup_span = bool(flags & 1) or (
+                    sz < line_max_sz * 0.77
+                    and prev_origin_y is not None
+                    and origin_y is not None
+                    and origin_y < prev_origin_y - 1.2
+                )
+                if (
+                    is_sup_span
+                    and re.fullmatch(r"\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*", stripped_t)
+                    and prev_nonempty_txt
+                    and re.search(r"[A-Za-z.,;:!?)\”\"']$", prev_nonempty_txt)
+                    and not (
+                        stripped_t in ("2", "3")
+                        and re.search(r"\b(?:mm|cm|km|m|s|in|ft)$", prev_nonempty_txt)
+                    )
+                ):
+                    span_strs.append(f" [{stripped_t}] ")
+                    continue
+
+                span_strs.append(txt)
+                font_name = span.get("font", "").lower()
+                is_span_bold = (
+                    bool(flags & 16) or ("bold" in font_name) or ("medi" in font_name) or ("demi" in font_name)
+                )
                 if not saw_first_span:
                     first_span_bold = is_span_bold
                     saw_first_span = True
-                n_chars = len(txt.strip())
+                n_chars = len(stripped_t)
                 font_sizes.append(sz)
                 char_weights.append(n_chars)
                 total_chars += n_chars
                 if is_span_bold:
                     bold_chars += n_chars
+                prev_nonempty_txt = stripped_t
+                if origin_y is not None:
+                    prev_origin_y = origin_y
+
             if span_strs:
                 lines_text.append("".join(span_strs))
 
@@ -177,20 +216,23 @@ def _extract_page_text_blocks(page: pymupdf.Page, page_num: int) -> list[_TextBl
         if not clean_text:
             continue
 
-        # Filter vertical margin stamps (e.g., arXiv sidebars)
+        # Ignore vertical margin watermarks (e.g. arXiv sidebars)
         if (bbox.x1 < 0.08 * w or bbox.x0 > 0.92 * w) and bbox.height > 2.2 * bbox.width:
             continue
         if _ARXIV_STAMP_RE.search(clean_text) and len(clean_text) < 120:
             continue
+        if _DOI_HEADER_RE.match(clean_text):
+            continue
 
-        # Filter running headers, footers, and standalone page numbers
-        if (bbox.y1 < 0.055 * h or bbox.y0 > 0.942 * h) and len(clean_text) < 115:
-            if not _CAPTION_START_RE.match(clean_text):
+        max_sz = max(font_sizes) if font_sizes else 10.0
+
+        # Ignore running headers, magazine section slugs ("contributed articles"), footers, and page numbers
+        if (bbox.y1 < 0.068 * h or bbox.y0 > 0.935 * h) and len(clean_text) < 125 and max_sz < 15.0:
+            if not _FIG_CAPTION_RE.match(clean_text) and not _TABLE_CAPTION_RE.match(clean_text):
                 continue
         if re.fullmatch(r"\d{1,4}", clean_text) and (bbox.y0 > 0.89 * h or bbox.y1 < 0.08 * h):
             continue
 
-        max_sz = max(font_sizes) if font_sizes else 10.0
         avg_sz = (
             sum(s * c for s, c in zip(font_sizes, char_weights)) / max(sum(char_weights), 1)
             if font_sizes
@@ -213,25 +255,34 @@ def _extract_page_text_blocks(page: pymupdf.Page, page_num: int) -> list[_TextBl
     return blocks
 
 
-def _is_figure_caption(tb: _TextBlock, body_font_size: float) -> str | None:
-    """Return figure number string (e.g. '1', '2a') if block is a figure caption, else None."""
-    m = _CAPTION_START_RE.match(tb.clean_text)
-    if not m:
-        return None
-    fig_num = m.group(1)
-    # Check if it's actually a prose paragraph starting with "Figure 1 shows..."
-    has_explicit_sep = bool(
-        re.match(r"^\s*(?:Figure|Fig\.?)\s*\d+[A-Za-z]?\s*[:.|—–\-]", tb.clean_text, re.IGNORECASE)
-    )
-    if not has_explicit_sep and not tb.first_span_bold:
-        if _FALSE_CAPTION_VERB_RE.match(tb.clean_text):
-            return None
-        if tb.avg_font_size > body_font_size + 0.5:
-            return None
-    return fig_num
+def _classify_caption(tb: _TextBlock, body_font_size: float) -> tuple[str, str] | None:
+    """Return ('Figure' | 'Table', num_str) if `tb` is a figure or table caption, else None."""
+    for kind_name, pat in (("Figure", _FIG_CAPTION_RE), ("Table", _TABLE_CAPTION_RE)):
+        m = pat.match(tb.clean_text)
+        if not m:
+            continue
+        num_str = m.group(1)
+        has_explicit_sep = bool(
+            re.match(
+                r"^\s*(?:Figure|Fig\.?|Table|Tab\.?)\s*(?:\d+[A-Za-z]?|[IVX]+)\s*[:.|—–\-]",
+                tb.clean_text,
+                re.IGNORECASE,
+            )
+        )
+        if not has_explicit_sep and not tb.first_span_bold:
+            if _FALSE_CAPTION_VERB_RE.match(tb.clean_text):
+                return None
+            if tb.avg_font_size > body_font_size + 0.5:
+                return None
+        return kind_name, num_str
+    return None
 
 
-def _collect_visual_regions(page: pymupdf.Page, caption_rects: list[pymupdf.Rect]) -> list[pymupdf.Rect]:
+def _collect_visual_regions(
+    page: pymupdf.Page,
+    caption_rects: list[pymupdf.Rect],
+    table_caption_rects: list[pymupdf.Rect],
+) -> list[pymupdf.Rect]:
     page_rect = page.rect
     w, h = page_rect.width, page_rect.height
     raw_boxes: list[pymupdf.Rect] = []
@@ -245,15 +296,68 @@ def _collect_visual_regions(page: pymupdf.Page, caption_rects: list[pymupdf.Rect
         seen_xrefs.add(xref)
         for r in page.get_image_rects(xref):
             r = r & page_rect
-            if r.is_empty or r.width < 42 or r.height < 42:
+            if r.is_empty or r.width < 38 or r.height < 35:
                 continue
             if r.width > 0.96 * w and r.height > 0.96 * h:
                 continue
             raw_boxes.append(r)
 
-    # 2. Vector graphics clusters (plots, charts, architecture diagrams)
+    # 2. Vector graphics clusters — filter out column divider lines & header/footer rules BEFORE clustering
     try:
-        drawing_clusters = page.cluster_drawings(x_tolerance=12, y_tolerance=12)
+        all_drawings = page.get_drawings()
+    except Exception:
+        all_drawings = []
+
+    filtered_drawings = []
+    horiz_rules: list[pymupdf.Rect] = []
+    for d in all_drawings:
+        dr = pymupdf.Rect(d.get("rect", (0, 0, 0, 0))) & page_rect
+        if dr.is_empty:
+            continue
+        has_fill = d.get("fill") is not None
+        items = d.get("items") or []
+
+        # Skip stroke-only paths made purely of vertical column dividers or margin header/footer rules
+        # (Adobe InDesign / CACM / IEEE often combine multiple column divider rules into one compound path)
+        if not has_fill and items:
+            all_dividers = True
+            for it in items:
+                op = it[0]
+                if op == "l" and len(it) >= 3:
+                    p1, p2 = it[1], it[2]
+                    dx = abs(float(p1.x) - float(p2.x))
+                    dy = abs(float(p1.y) - float(p2.y))
+                    is_vert_col_rule = dx < 3.5 and dy > 85
+                    is_margin_horiz_rule = (
+                        dy < 3.5
+                        and dx > 0.45 * w
+                        and (max(float(p1.y), float(p2.y)) < 0.08 * h or min(float(p1.y), float(p2.y)) > 0.92 * h)
+                    )
+                    if not (is_vert_col_rule or is_margin_horiz_rule):
+                        all_dividers = False
+                        break
+                else:
+                    all_dividers = False
+                    break
+            if all_dividers:
+                continue
+
+        if dr.width < 3.5 and dr.height > 85 and not has_fill:
+            continue
+        if dr.height < 3.5 and dr.width > 0.50 * w and (dr.y1 < 0.08 * h or dr.y0 > 0.92 * h) and not has_fill:
+            continue
+        if dr.width < 9 and dr.height < 9:
+            continue
+        if dr.height < 4.0 and dr.width >= 90:
+            horiz_rules.append(dr)
+        filtered_drawings.append(d)
+
+    try:
+        drawing_clusters = (
+            page.cluster_drawings(drawings=filtered_drawings, x_tolerance=10, y_tolerance=10)
+            if filtered_drawings
+            else []
+        )
     except Exception:
         drawing_clusters = []
 
@@ -261,12 +365,26 @@ def _collect_visual_regions(page: pymupdf.Page, caption_rects: list[pymupdf.Rect
         r = pymupdf.Rect(dr) & page_rect
         if r.is_empty:
             continue
-        # Ignore thin rules/lines (underlines, table borders, header bars)
-        if r.width < 48 or r.height < 38:
+        if r.width < 46 or r.height < 34:
             continue
         if r.width > 0.96 * w and r.height > 0.96 * h:
             continue
         raw_boxes.append(r)
+
+    # 3. Unboxed LaTeX booktabs tables (horizontal rules aligned under/above a Table caption)
+    if table_caption_rects and len(horiz_rules) >= 2:
+        for tcap in table_caption_rects:
+            aligned_rules = [
+                hr
+                for hr in horiz_rules
+                if _horiz_overlap(hr, tcap) >= 0.45 and -260 <= (hr.y0 - tcap.y1) <= 260
+            ]
+            if len(aligned_rules) >= 2:
+                u = pymupdf.Rect(aligned_rules[0])
+                for hr in aligned_rules[1:]:
+                    u |= hr
+                if u.height >= 28:
+                    raw_boxes.append(u)
 
     return _merge_visual_boxes(raw_boxes, caption_rects)
 
@@ -278,57 +396,83 @@ def _extract_figures_on_page(
     body_font_size: float,
     figures_dir: Path,
     start_fig_counter: int,
-) -> tuple[list[_ExtractedFigure], set[int]]:
-    """Detect & crop figures on a page, returning (figures, excluded_text_block_indices)."""
+) -> tuple[list[_ExtractedFigure], set[int], set[int]]:
+    """Detect & crop both Figures and Tables, returning (figures, excluded_block_idxs, callout_box_block_idxs)."""
     page_rect = page.rect
-    w, h = page_rect.width, page_rect.height
 
-    caption_entries: list[tuple[int, str, _TextBlock]] = []
+    caption_entries: list[tuple[int, str, str, _TextBlock]] = []  # (block_idx, kind_name, num_str, tb)
     table_caption_rects: list[pymupdf.Rect] = []
     for idx, tb in enumerate(text_blocks):
-        fig_num = _is_figure_caption(tb, body_font_size)
-        if fig_num is not None:
-            caption_entries.append((idx, fig_num, tb))
-        elif _TABLE_CAPTION_RE.match(tb.clean_text):
-            table_caption_rects.append(tb.bbox)
+        classified = _classify_caption(tb, body_font_size)
+        if classified is not None:
+            kind_name, num_str = classified
+            caption_entries.append((idx, kind_name, num_str, tb))
+            if kind_name == "Table":
+                table_caption_rects.append(tb.bbox)
 
-    barriers = [tb.bbox for _, _, tb in caption_entries] + table_caption_rects
-    visual_boxes = _collect_visual_regions(page, barriers)
+    barriers = [tb.bbox for _, _, _, tb in caption_entries]
+    visual_boxes = _collect_visual_regions(page, barriers, table_caption_rects)
     used_visuals: set[int] = set()
     excluded_block_idxs: set[int] = set()
     extracted: list[_ExtractedFigure] = []
     fig_counter = start_fig_counter
 
-    for cap_idx, fig_num, cap_tb in caption_entries:
+    for cap_idx, kind_name, fig_num, cap_tb in caption_entries:
         cap_rect = cap_tb.bbox
         excluded_block_idxs.add(cap_idx)
+        other_barriers = [b for b in barriers if b != cap_rect]
 
-        # Find visual boxes above caption first (standard academic layout)
-        above_candidates: list[int] = []
+        # 1. Check if a shaded container box directly wraps BOTH the caption bar and the diagram/table
+        wrapping_idxs: list[int] = []
         for v_idx, vr in enumerate(visual_boxes):
             if v_idx in used_visuals:
                 continue
-            # Visual is above caption and not separated by another caption/long prose block
-            if vr.y1 <= cap_rect.y0 + 24 and (cap_rect.y0 - vr.y1) <= 165:
-                if _horiz_overlap(vr, cap_rect) >= 0.25 or vr.width > 0.65 * w or cap_rect.width > 0.65 * w:
-                    if not _separated_by_barrier(vr, cap_rect, [b for b in barriers if b != cap_rect]):
-                        above_candidates.append(v_idx)
+            if _rect_overlap_ratio(cap_rect, vr) >= 0.55 and vr.height >= cap_rect.height + 28:
+                wrapping_idxs.append(v_idx)
 
-        chosen_vis_idxs = above_candidates
-        if not chosen_vis_idxs:
-            # Check visual boxes immediately below caption (captions-on-top style)
+        above_candidates: list[tuple[float, int]] = []
+        below_candidates: list[tuple[float, int]] = []
+
+        if not wrapping_idxs:
             for v_idx, vr in enumerate(visual_boxes):
                 if v_idx in used_visuals:
                     continue
-                if vr.y0 >= cap_rect.y1 - 18 and (vr.y0 - cap_rect.y1) <= 110:
-                    if _horiz_overlap(vr, cap_rect) >= 0.25 or vr.width > 0.65 * w:
-                        if not _separated_by_barrier(cap_rect, vr, [b for b in barriers if b != cap_rect]):
-                            chosen_vis_idxs.append(v_idx)
+                if _horiz_overlap(vr, cap_rect) < 0.25:
+                    continue
+
+                # Candidate above caption (classic arXiv / LaTeX style)
+                if vr.y1 <= cap_rect.y0 + 20 and (cap_rect.y0 - vr.y1) <= 155:
+                    if not _separated_by_barrier(vr, cap_rect, other_barriers):
+                        gap = max(0.0, cap_rect.y0 - vr.y1)
+                        above_candidates.append((gap, v_idx))
+
+                # Candidate below caption (CACM / IEEE / Nature header-bar style)
+                if vr.y0 >= cap_rect.y0 - 6 and (vr.y0 - cap_rect.y1) <= 155 and vr.y1 > cap_rect.y1 + 20:
+                    if not _separated_by_barrier(cap_rect, vr, other_barriers):
+                        gap = max(0.0, vr.y0 - cap_rect.y1)
+                        below_candidates.append((gap, v_idx))
+
+        if wrapping_idxs:
+            chosen_vis_idxs = wrapping_idxs
+        elif above_candidates and below_candidates:
+            # Pick whichever side sits closer to the caption (0pt touching header bar beats 22pt gap to prior table)
+            min_above = min(g for g, _ in above_candidates)
+            min_below = min(g for g, _ in below_candidates)
+            if min_below + 4.0 < min_above:
+                chosen_vis_idxs = [i for _, i in below_candidates]
+            else:
+                chosen_vis_idxs = [i for _, i in above_candidates]
+        elif above_candidates:
+            chosen_vis_idxs = [i for _, i in above_candidates]
+        elif below_candidates:
+            chosen_vis_idxs = [i for _, i in below_candidates]
+        else:
+            chosen_vis_idxs = []
 
         if not chosen_vis_idxs:
-            # Fallback: if a diagram consists purely of arranged text boxes + thin arrows missed by cluster_drawings,
-            # look for a non-prose zone directly above the caption.
-            fallback_top = max(page_rect.y0 + 28, cap_rect.y0 - 210)
+            if kind_name == "Table":
+                continue
+            fallback_top = max(page_rect.y0 + 28, cap_rect.y0 - 200)
             for idx_other, other_tb in enumerate(text_blocks):
                 if idx_other == cap_idx:
                     continue
@@ -345,49 +489,77 @@ def _extract_figures_on_page(
             for v_idx in chosen_vis_idxs:
                 used_visuals.add(v_idx)
 
-        # Expand slightly to include outer plot axis labels, titles, subfigure (a)/(b) markers, and tick numbers
-        expanded_vis = pymupdf.Rect(
-            max(page_rect.x0 + 8, vis_union.x0 - 30),
-            max(page_rect.y0 + 8, vis_union.y0 - 22),
-            min(page_rect.x1 - 8, vis_union.x1 + 22),
-            min(page_rect.y1 - 8, vis_union.y1 + 24),
+        # Absorb sub-caption notes sitting right between a top caption bar and the visual (e.g., CACM Figure 3 / 4)
+        caption_full = cap_tb.clean_text
+        between_zone = pymupdf.Rect(
+            min(cap_rect.x0, vis_union.x0),
+            min(cap_rect.y0, vis_union.y0),
+            max(cap_rect.x1, vis_union.x1),
+            max(cap_rect.y1, vis_union.y1),
         )
-        # Do not intrude into the caption itself or long body paragraphs
+        for idx_other, other_tb in enumerate(text_blocks):
+            if idx_other in excluded_block_idxs:
+                continue
+            if (
+                other_tb.bbox.y0 >= cap_rect.y1 - 3
+                and other_tb.bbox.y1 <= vis_union.y0 + 6
+                and _horiz_overlap(other_tb.bbox, between_zone) >= 0.45
+            ):
+                caption_full = f"{caption_full} {other_tb.clean_text}"
+                excluded_block_idxs.add(idx_other)
+
+        # Expand moderately for axis labels/ticks without crossing narrow 3-column gutters into neighbor prose
+        expanded_vis = pymupdf.Rect(
+            max(page_rect.x0 + 6, vis_union.x0 - 14),
+            max(page_rect.y0 + 6, vis_union.y0 - 18),
+            min(page_rect.x1 - 6, vis_union.x1 + 14),
+            min(page_rect.y1 - 6, vis_union.y1 + 20),
+        )
         if expanded_vis.y0 < cap_rect.y0 and vis_union.y1 <= cap_rect.y0 + 16:
             expanded_vis.y1 = min(expanded_vis.y1, cap_rect.y0 - 2)
 
         for idx_other, other_tb in enumerate(text_blocks):
             if idx_other in excluded_block_idxs:
                 continue
+            # All text inside a figure/table's visual box (axis ticks, table cells, diagram boxes) is excluded from prose
+            if _rect_overlap_ratio(other_tb.bbox, vis_union) >= 0.50:
+                excluded_block_idxs.add(idx_other)
+                continue
             inter = expanded_vis & other_tb.bbox
             if inter.is_empty:
                 continue
-            # Short labels (axis titles, ticks, legend entries) belong inside the figure crop
-            if len(other_tb.clean_text) <= 115 and not _SECTION_HEADING_RE.match(other_tb.clean_text):
+            # Only absorb short outer axis labels that align horizontally with this figure (not adjacent column prose)
+            if (
+                len(other_tb.clean_text) <= 90
+                and _horiz_overlap(other_tb.bbox, vis_union) >= 0.25
+                and not _SECTION_HEADING_RE.match(other_tb.clean_text)
+            ):
                 vis_union |= other_tb.bbox
                 excluded_block_idxs.add(idx_other)
-            elif _rect_overlap_ratio(other_tb.bbox, vis_union) > 0.55:
-                excluded_block_idxs.add(idx_other)
 
-        # Add crisp white padding around the final figure crop without slicing into the caption
-        crop_y0 = max(page_rect.y0 + 4, vis_union.y0 - 10)
-        crop_y1 = min(page_rect.y1 - 4, vis_union.y1 + 10)
+        # Compute clean crop bounds without slicing through external captions
+        crop_y0 = max(page_rect.y0 + 4, vis_union.y0 - 8)
+        crop_y1 = min(page_rect.y1 - 4, vis_union.y1 + 8)
         if vis_union.y1 <= cap_rect.y0 + 16 and crop_y0 < cap_rect.y0:
             crop_y1 = min(crop_y1, cap_rect.y0 - 2)
-        elif vis_union.y0 >= cap_rect.y1 - 16 and crop_y1 > cap_rect.y1:
+        elif vis_union.y0 >= cap_rect.y1 - 12 and crop_y1 > cap_rect.y1 + 24:
             crop_y0 = max(crop_y0, cap_rect.y1 + 2)
+        elif _rect_overlap_ratio(cap_rect, vis_union) >= 0.55 and (vis_union.y1 - cap_rect.y1) >= 35:
+            # Caption sits in a top header bar inside the shaded container: start crop cleanly below the header bar
+            crop_y0 = cap_rect.y1 + 1
 
         crop_rect = pymupdf.Rect(
-            max(page_rect.x0 + 4, vis_union.x0 - 10),
+            max(page_rect.x0 + 4, vis_union.x0 - 8),
             crop_y0,
-            min(page_rect.x1 - 4, vis_union.x1 + 10),
+            min(page_rect.x1 - 4, vis_union.x1 + 8),
             crop_y1,
         )
-        if crop_rect.width < 45 or crop_rect.height < 40:
+        if crop_rect.width < 45 or crop_rect.height < 32:
             continue
 
         fig_counter += 1
-        fig_id = f"fig_{fig_counter}"
+        prefix = "fig" if kind_name == "Figure" else "tab"
+        fig_id = f"{prefix}_{fig_counter}"
         img_filename = f"{fig_id}.png"
         img_path = figures_dir / img_filename
         pix = page.get_pixmap(clip=crop_rect, dpi=220, alpha=False)
@@ -396,36 +568,44 @@ def _extract_figures_on_page(
         extracted.append(
             _ExtractedFigure(
                 figure_id=fig_id,
+                kind_name=kind_name,
                 figure_num=fig_num,
-                figure_label=f"Figure {fig_num}",
+                figure_label=f"{kind_name} {fig_num}",
                 page_num=page_num,
                 crop_rect=crop_rect,
                 exclusion_rects=[crop_rect, cap_rect],
-                caption=cap_tb.clean_text,
+                caption=caption_full,
                 image_filename=img_filename,
                 image_path=str(img_path),
                 anchor_y=min(crop_rect.y0, cap_rect.y0),
             )
         )
 
-    # Also capture standalone large visual figures without a formal "Figure N:" caption (slides, reports, diagrams)
+    # Also capture standalone uncaptioned figures, while separating shaded text callout boxes (e.g. "key insights")
+    callout_block_idxs: set[int] = set()
     for v_idx, vr in enumerate(visual_boxes):
         if v_idx in used_visuals:
             continue
-        if vr.width < 125 or vr.height < 95 or (vr.width * vr.height) < 18000:
+        inside_pairs = [
+            (i, tb)
+            for i, tb in enumerate(text_blocks)
+            if i not in excluded_block_idxs and _rect_overlap_ratio(tb.bbox, vr) >= 0.55
+        ]
+        inside_chars = sum(len(tb.clean_text) for _, tb in inside_pairs)
+        if inside_chars >= 60 and (any(len(tb.clean_text) > 55 for _, tb in inside_pairs) or len(inside_pairs) >= 2):
+            # Shaded prose sidebar / callout box: defer its blocks past inline columns so split words don't break
+            for i, _ in inside_pairs:
+                callout_block_idxs.add(i)
             continue
-        # Skip if right next to a Table caption (likely a boxed table)
-        near_table = any(
-            abs(vr.y0 - tr.y1) < 35 or abs(tr.y0 - vr.y1) < 35 for tr in table_caption_rects
-        )
-        if near_table:
+
+        if vr.width < 130 or vr.height < 100 or (vr.width * vr.height) < 20000:
             continue
 
         crop_rect = pymupdf.Rect(
-            max(page_rect.x0 + 4, vr.x0 - 10),
-            max(page_rect.y0 + 4, vr.y0 - 10),
-            min(page_rect.x1 - 4, vr.x1 + 10),
-            min(page_rect.y1 - 4, vr.y1 + 10),
+            max(page_rect.x0 + 4, vr.x0 - 8),
+            max(page_rect.y0 + 4, vr.y0 - 8),
+            min(page_rect.x1 - 4, vr.x1 + 8),
+            min(page_rect.y1 - 4, vr.y1 + 8),
         )
         for idx_other, other_tb in enumerate(text_blocks):
             if idx_other in excluded_block_idxs:
@@ -443,6 +623,7 @@ def _extract_figures_on_page(
         extracted.append(
             _ExtractedFigure(
                 figure_id=fig_id,
+                kind_name="Figure",
                 figure_num=None,
                 figure_label=f"Figure (Page {page_num})",
                 page_num=page_num,
@@ -456,42 +637,102 @@ def _extract_figures_on_page(
         )
 
     extracted.sort(key=lambda f: f.anchor_y)
-    return extracted, excluded_block_idxs
+    return extracted, excluded_block_idxs, callout_block_idxs
 
 
-def _order_blocks_academic(blocks: list[_TextBlock], page_width: float) -> list[_TextBlock]:
-    """Order blocks cleanly across full-width banners and two-column layouts."""
+def _split_by_x_gutters(blocks: list[_TextBlock], page_width: float) -> list[list[_TextBlock]] | None:
+    """Split `blocks` left-to-right across vertical column gutters (supports 1, 2, 3, or N columns)."""
     if len(blocks) <= 1:
-        return blocks
+        return None
 
-    mid_x = page_width * 0.5
+    min_gutter = max(7.0, page_width * 0.011)
+    min_col_width = page_width * 0.115
 
-    def is_spanning(b: _TextBlock) -> bool:
-        return b.bbox.x0 < page_width * 0.46 and b.bbox.x1 > page_width * 0.54
+    by_x = sorted(blocks, key=lambda b: (b.bbox.x0, b.bbox.x1))
+    raw_groups: list[list[_TextBlock]] = [[by_x[0]]]
+    cur_x1 = by_x[0].bbox.x1
 
-    rough = sorted(blocks, key=lambda b: (round(b.bbox.y0, 1), round(b.bbox.x0, 1)))
-    ordered: list[_TextBlock] = []
-    col_buffer: list[_TextBlock] = []
-
-    def flush_columns() -> None:
-        if not col_buffer:
-            return
-        left = [b for b in col_buffer if (b.bbox.x0 + b.bbox.x1) * 0.5 < mid_x]
-        right = [b for b in col_buffer if (b.bbox.x0 + b.bbox.x1) * 0.5 >= mid_x]
-        left.sort(key=lambda b: (round(b.bbox.y0, 1), round(b.bbox.x0, 1)))
-        right.sort(key=lambda b: (round(b.bbox.y0, 1), round(b.bbox.x0, 1)))
-        ordered.extend(left)
-        ordered.extend(right)
-        col_buffer.clear()
-
-    for b in rough:
-        if is_spanning(b):
-            flush_columns()
-            ordered.append(b)
+    for b in by_x[1:]:
+        if b.bbox.x0 >= cur_x1 + min_gutter:
+            raw_groups.append([b])
+            cur_x1 = b.bbox.x1
         else:
-            col_buffer.append(b)
-    flush_columns()
-    return ordered
+            raw_groups[-1].append(b)
+            cur_x1 = max(cur_x1, b.bbox.x1)
+
+    if len(raw_groups) <= 1:
+        return None
+
+    def is_substantial_col(grp: list[_TextBlock]) -> bool:
+        grp_x0 = min(x.bbox.x0 for x in grp)
+        grp_x1 = max(x.bbox.x1 for x in grp)
+        chars = sum(len(x.clean_text) for x in grp)
+        return (grp_x1 - grp_x0) >= min_col_width and chars >= 18
+
+    # Merge tiny margin artifacts (like equation tags "(1)" or stray bullets) into their adjacent group
+    merged_groups: list[list[_TextBlock]] = []
+    for grp in raw_groups:
+        if not merged_groups:
+            merged_groups.append(grp)
+            continue
+        if not is_substantial_col(grp):
+            merged_groups[-1].extend(grp)
+        elif not is_substantial_col(merged_groups[-1]):
+            merged_groups[-1].extend(grp)
+        else:
+            merged_groups.append(grp)
+
+    if len(merged_groups) <= 1:
+        return None
+    return merged_groups
+
+
+def _split_by_y_bands(blocks: list[_TextBlock]) -> list[list[_TextBlock]] | None:
+    """Split `blocks` top-to-bottom across horizontal whitespace bands."""
+    if len(blocks) <= 1:
+        return None
+
+    by_y = sorted(blocks, key=lambda b: (b.bbox.y0, b.bbox.y1))
+    bands: list[list[_TextBlock]] = [[by_y[0]]]
+    cur_y1 = by_y[0].bbox.y1
+
+    for b in by_y[1:]:
+        # Allow tiny 1.5pt ascender/descender box touch when lines are clearly stacked
+        if b.bbox.y0 >= cur_y1 - 1.5:
+            bands.append([b])
+            cur_y1 = b.bbox.y1
+        else:
+            bands[-1].append(b)
+            cur_y1 = max(cur_y1, b.bbox.y1)
+
+    return bands if len(bands) >= 2 else None
+
+
+def _order_blocks_xy_cut(blocks: list[_TextBlock], page_width: float) -> list[_TextBlock]:
+    """Recursive X-first XY-Cut reading order for 1-column, 2-column, 3-column, and mixed-spanning pages."""
+    if len(blocks) <= 1:
+        return list(blocks)
+
+    # 1. Prefer vertical column cuts whenever clean vertical gutters run through this zone
+    x_cols = _split_by_x_gutters(blocks, page_width)
+    if x_cols is not None:
+        ordered: list[_TextBlock] = []
+        for col in x_cols:
+            ordered.extend(_order_blocks_xy_cut(col, page_width))
+        return ordered
+
+    # 2. Otherwise split horizontally across full-width / multi-column spanning bands
+    y_bands = _split_by_y_bands(blocks)
+    if y_bands is not None:
+        ordered = []
+        for band in y_bands:
+            ordered.extend(_order_blocks_xy_cut(band, page_width))
+        return ordered
+
+    # 3. Irreducible L-shaped wrap: peel off the topmost wide block and recurse on the remainder
+    top_idx = min(range(len(blocks)), key=lambda i: (round(blocks[i].bbox.y0, 1), round(blocks[i].bbox.x0, 1)))
+    rest = [b for i, b in enumerate(blocks) if i != top_idx]
+    return [blocks[top_idx]] + _order_blocks_xy_cut(rest, page_width)
 
 
 def _estimate_body_font_size(all_page_blocks: list[list[_TextBlock]]) -> float:
@@ -515,12 +756,12 @@ def parse_pdf_document(
     filename: str | None = None,
     strip_citations: bool = True,
 ) -> DocumentSession:
-    """Parse an academic or general PDF into ordered narrative segments + high-res extracted figures."""
     figures_dir = session_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     doc = pymupdf.open(str(pdf_path))
     page_count = len(doc)
+    page1_height = doc[0].rect.height if page_count > 0 else 792.0
 
     raw_page_blocks: list[list[_TextBlock]] = []
     for p_idx in range(page_count):
@@ -530,12 +771,13 @@ def parse_pdf_document(
 
     all_figures: list[_ExtractedFigure] = []
     ordered_text_blocks: list[_TextBlock] = []
+    deferred_callouts: list[_TextBlock] = []
     fig_counter = 0
 
     for p_idx in range(page_count):
         page = doc[p_idx]
         p_blocks = raw_page_blocks[p_idx]
-        page_figs, excluded_idxs = _extract_figures_on_page(
+        page_figs, excluded_idxs, callout_idxs = _extract_figures_on_page(
             page=page,
             page_num=p_idx + 1,
             text_blocks=p_blocks,
@@ -546,20 +788,39 @@ def parse_pdf_document(
         fig_counter += len(page_figs)
         all_figures.extend(page_figs)
 
-        kept_blocks = [b for i, b in enumerate(p_blocks) if i not in excluded_idxs]
-        ordered_text_blocks.extend(_order_blocks_academic(kept_blocks, page.rect.width))
+        kept_blocks: list[_TextBlock] = []
+        page_callouts: list[_TextBlock] = []
+        for i, b in enumerate(p_blocks):
+            if i in excluded_idxs:
+                continue
+            if i in callout_idxs:
+                page_callouts.append(b)
+                continue
+            # Skip oversized magazine pull-quotes on body pages (e.g. CACM middle-column callouts)
+            if (
+                b.page_num >= 2
+                and b.avg_font_size >= body_font_size + 3.2
+                and len(b.clean_text.split()) >= 7
+                and not _SECTION_HEADING_RE.match(b.clean_text)
+            ):
+                continue
+            kept_blocks.append(b)
+
+        ordered_text_blocks.extend(_order_blocks_xy_cut(kept_blocks, page.rect.width))
+        if page_callouts:
+            deferred_callouts.extend(_order_blocks_xy_cut(page_callouts, page.rect.width))
 
     doc.close()
 
-    # Identify Document Title on page 1 (and merge multi-line title blocks sharing the same large font)
+    # Identify Document Title on page 1 (and merge multi-line stacked titles up to 8 lines)
     doc_title = (filename or "Untitled Paper").rsplit(".", 1)[0]
     title_block_indices: set[int] = set()
     page1_candidates = [
         (i, b)
-        for i, b in enumerate(ordered_text_blocks[:8])
+        for i, b in enumerate(ordered_text_blocks[:12])
         if b.page_num == 1
-        and b.bbox.y0 < 320
-        and 4 <= len(b.clean_text) <= 260
+        and b.bbox.y0 < page1_height * 0.52
+        and 3 <= len(b.clean_text) <= 260
         and not _SECTION_HEADING_RE.match(b.clean_text)
     ]
     if page1_candidates:
@@ -568,12 +829,12 @@ def parse_pdf_document(
             title_parts = [best_b.clean_text]
             title_block_indices.add(best_i)
             prev_b = best_b
-            for nxt_i in range(best_i + 1, min(best_i + 4, len(ordered_text_blocks))):
+            for nxt_i in range(best_i + 1, min(best_i + 8, len(ordered_text_blocks))):
                 nxt_b = ordered_text_blocks[nxt_i]
                 if (
                     nxt_b.page_num == 1
-                    and abs(nxt_b.max_font_size - best_b.max_font_size) <= 0.6
-                    and -8 <= (nxt_b.bbox.y0 - prev_b.bbox.y1) <= 18
+                    and abs(nxt_b.max_font_size - best_b.max_font_size) <= 0.8
+                    and -12 <= (nxt_b.bbox.y0 - prev_b.bbox.y1) <= 22
                     and not _SECTION_HEADING_RE.match(nxt_b.clean_text)
                 ):
                     title_parts.append(nxt_b.clean_text)
@@ -581,34 +842,40 @@ def parse_pdf_document(
                     prev_b = nxt_b
                 else:
                     break
-            doc_title = " ".join(title_parts)
+            doc_title = clean_display_text("\n".join(title_parts))
 
-    # Classify blocks into title / headings / paragraphs / references and merge split paragraphs
     draft_items: list[dict] = []
     current_section = "Overview"
     in_references = False
-    emitted_title = False
+
+    if title_block_indices:
+        draft_items.append(
+            {
+                "kind": "title",
+                "section": "Title",
+                "page": 1,
+                "display_text": doc_title,
+                "skip_by_default": False,
+            }
+        )
+
+    for cb in deferred_callouts:
+        if cb.clean_text:
+            draft_items.append(
+                {
+                    "kind": "paragraph",
+                    "section": "Key Insights",
+                    "page": cb.page_num,
+                    "display_text": cb.clean_text,
+                    "skip_by_default": False,
+                }
+            )
 
     for idx, tb in enumerate(ordered_text_blocks):
         txt = tb.clean_text
-        if not txt:
+        if not txt or idx in title_block_indices:
             continue
 
-        if idx in title_block_indices:
-            if not emitted_title:
-                emitted_title = True
-                draft_items.append(
-                    {
-                        "kind": "title",
-                        "section": "Title",
-                        "page": tb.page_num,
-                        "display_text": doc_title,
-                        "skip_by_default": False,
-                    }
-                )
-            continue
-
-        # Skip author affiliation / email blocks right under the title if short/noisy, or keep concise author line
         if _REFERENCES_HEADING_RE.match(txt) and len(txt) <= 40:
             in_references = True
             current_section = "References"
@@ -628,8 +895,7 @@ def parse_pdf_document(
             if _SECTION_HEADING_RE.match(txt):
                 is_heading = True
             elif (tb.is_bold or tb.max_font_size >= body_font_size + 1.2) and len(txt.split()) <= 11:
-                # Ensure it's not an inline run-in paragraph or equation fragment
-                if re.match(r"^(?:\d+(?:\.\d+)*\s+)?[A-Z]", txt):
+                if re.match(r"^(?:\d+(?:\.\d+)*\s+)?[A-Z]", txt) and not txt.upper().startswith("BY "):
                     is_heading = True
 
         if is_heading:
@@ -657,7 +923,7 @@ def parse_pdf_document(
             )
             continue
 
-        # Merge paragraphs split mid-sentence across column/page boundaries
+        # Merge sentences split mid-clause across column bottoms or page breaks
         if (
             draft_items
             and draft_items[-1]["kind"] == "paragraph"
@@ -666,7 +932,8 @@ def parse_pdf_document(
         ):
             prev_txt = draft_items[-1]["display_text"]
             if prev_txt.endswith("-"):
-                draft_items[-1]["display_text"] = prev_txt[:-1] + txt
+                joined_split = clean_display_text(f"{prev_txt}\n{txt}")
+                draft_items[-1]["display_text"] = joined_split
             else:
                 draft_items[-1]["display_text"] = f"{prev_txt} {txt}"
             continue
@@ -681,19 +948,24 @@ def parse_pdf_document(
             }
         )
 
-    # Match each figure to the paragraph that references it
+    # Match each Figure / Table to the first paragraph that cites it
     insert_after_map: dict[int, list[_ExtractedFigure]] = {}
     citing_contexts: dict[str, str] = {}
 
     for fig in all_figures:
         matched_indices: list[int] = []
         if fig.figure_num:
-            # Match "Figure 2", "Fig. 2", "Figures 1 and 2", "Figs. 2-4"
             num_esc = re.escape(fig.figure_num)
-            cite_pat = re.compile(
-                rf"\b(?:Figures?|Figs?\.?)\s*(?:\d+[A-Za-z]?\s*(?:,|and|&|–|-)\s*)*{num_esc}(?![0-9A-Za-z])",
-                re.IGNORECASE,
-            )
+            if fig.kind_name == "Table":
+                cite_pat = re.compile(
+                    rf"\b(?:Tables?|Tabs?\.?)\s*(?:(?:\d+[A-Za-z]?|[IVX]+)\s*(?:,|and|&|–|-)\s*)*{num_esc}(?![0-9A-Za-z])",
+                    re.IGNORECASE,
+                )
+            else:
+                cite_pat = re.compile(
+                    rf"\b(?:Figures?|Figs?\.?)\s*(?:\d+[A-Za-z]?\s*(?:,|and|&|–|-)\s*)*{num_esc}(?![0-9A-Za-z])",
+                    re.IGNORECASE,
+                )
             for d_idx, item in enumerate(draft_items):
                 if item["kind"] == "paragraph" and cite_pat.search(item["display_text"]):
                     matched_indices.append(d_idx)
@@ -703,14 +975,12 @@ def parse_pdf_document(
             ctx_snippets = [draft_items[i]["display_text"] for i in matched_indices[:2]]
             citing_contexts[fig.figure_id] = " ".join(ctx_snippets)[:950]
         else:
-            # Place at the end of the non-reference paragraphs on the figure's page (or nearest preceding paragraph)
             page_candidates = [
                 i
                 for i, item in enumerate(draft_items)
                 if item["page"] is not None and item["page"] <= fig.page_num and not item["skip_by_default"]
             ]
             anchor_idx = page_candidates[-1] if page_candidates else max(len(draft_items) - 1, 0)
-            # Gather local page context for the VLM
             nearby = [
                 item["display_text"]
                 for item in draft_items[max(0, anchor_idx - 1) : anchor_idx + 2]
@@ -720,7 +990,6 @@ def parse_pdf_document(
 
         insert_after_map.setdefault(anchor_idx, []).append(fig)
 
-    # Assemble final Segment stream
     segments: list[Segment] = []
 
     def append_figure_segment(fig: _ExtractedFigure, section_name: str | None) -> None:
@@ -799,9 +1068,8 @@ def parse_text_document(
     title: str | None = None,
     strip_citations: bool = True,
 ) -> DocumentSession:
-    """Parse pasted academic text, Markdown, or notes into clean spoken narrative segments."""
     lines = raw_text.replace("\r\n", "\n").split("\n")
-    paragraphs: list[tuple[str, str]] = []  # (kind, text)
+    paragraphs: list[tuple[str, str]] = []
     buf: list[str] = []
 
     def flush_buf() -> None:
@@ -837,7 +1105,7 @@ def parse_text_document(
             inferred_title = paragraphs[0][1]
         elif paragraphs:
             first_words = " ".join(paragraphs[0][1].split()[:9])
-            inferred_title = first_words + ("…" if len(paragraphs[0][1].split()) > 9 else "")
+            inferred_title = first_words + ("..." if len(paragraphs[0][1].split()) > 9 else "")
         else:
             inferred_title = "Pasted Text"
 

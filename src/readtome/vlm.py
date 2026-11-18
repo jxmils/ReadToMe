@@ -89,11 +89,19 @@ def _build_figure_prompt(
     if citing_context:
         parts.append(f"Surrounding text from the paper: {citing_context}")
 
+    is_table = figure_label.lower().startswith("table")
     if custom_question and custom_question.strip():
         parts.append(
-            f"Answer this question about the figure based on what is shown in the image: "
+            f"Answer this question based on what is shown in the image: "
             f"{custom_question.strip()}\n"
             f"Use 2 to 4 plain spoken sentences. Do not use markdown, bullets, or asterisks."
+        )
+    elif is_table:
+        parts.append(
+            f"Start naturally (like 'Looking at {figure_label}, ...'). In 3 or 4 plain spoken sentences, "
+            "say what this table compares, call out the most notable numbers or differences across rows and columns, "
+            "and state the main takeaway without reading every cell one by one. "
+            "No markdown or bullet points."
         )
     elif detail_level == "concise":
         parts.append(

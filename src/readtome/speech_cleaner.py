@@ -61,6 +61,23 @@ _KEEP_HYPHEN_PREFIXES = {
     "double",
     "well",
     "ill",
+    "domain",
+    "layer",
+    "peer",
+    "time",
+    "all",
+    "on",
+    "off",
+    "in",
+    "up",
+    "back",
+    "run",
+    "hand",
+    "hard",
+    "soft",
+    "best",
+    "world",
+    "first",
 }
 
 _GREEK_MAP = {
@@ -111,7 +128,13 @@ def clean_display_text(raw: str) -> str:
     if not raw:
         return ""
     text = raw.translate(_LIGATURES)
-    text = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})", _dehyphenate_match, text)
+    # Strip private-use font bullet glyphs common in magazine/ACM PDFs
+    text = re.sub(r"[\ue000-\uf8ff˲˽]+", "• ", text)
+    # Fix InDesign / custom Type1 soft-hyphen replacement chars (e.g., "Pro\ufffdcessing")
+    text = re.sub(r"([A-Za-z]{2,})\ufffd\s*\n?\s*([A-Za-z]{2,})", _dehyphenate_match, text)
+    text = text.replace("\ufffd", "")
+    # Join words split across lines with a hyphen
+    text = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([A-Za-z]{2,})", _dehyphenate_match, text)
     text = re.sub(r"\s*\n\s*", " ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
@@ -123,12 +146,19 @@ def prepare_spoken_text(display_text: str, *, strip_citations: bool = True) -> s
 
     text = display_text
 
+    # Remove bullet symbols so TTS reads bulleted lines cleanly
+    text = re.sub(r"[•▸►▪▫◦‣»]+", " ", text)
+
     # Drop bare parenthetical links and shorten inline URLs
     text = re.sub(r"\(\s*https?://[^\s)]+\s*\)", "", text)
     text = re.sub(r"https?://\S+", "see link", text)
 
     if strip_citations:
+        # Bracketed numeric citations: [1], [2, 5, 11], [3-7]
         text = re.sub(r"\[\s*\d+(?:\s*[,;–\-]\s*\d+)*\s*\]", "", text)
+        # Trailing superscript-style citations attached after punctuation: "Law.17", "inference.19,20", "(SGD).31"
+        text = re.sub(r"([A-Za-z)\”\"'][.,;:])\d{1,3}(?:[,–\-]\d{1,3})*(?=\s|$|[)\]\"”'])", r"\1", text)
+        # Multi-author parenthetical citations
         text = re.sub(
             r"\((?:[A-Z][A-Za-z'\-]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][A-Za-z'\-]+))?,?\s*\d{4}[a-z]?\s*[;,]\s*)+"
             r"[A-Z][A-Za-z'\-]+(?:\s+(?:et\s+al\.?|and\s+[A-Z][A-Za-z'\-]+))?,?\s*\d{4}[a-z]?\)",
@@ -146,9 +176,9 @@ def prepare_spoken_text(display_text: str, *, strip_citations: bool = True) -> s
     text = re.sub(r"\b(\d+(?:\.\d+)?)\s*[μµ]L\b", r"\1 microliters", text)
     text = re.sub(r"\b(\d+(?:\.\d+)?)\s*[μµ]M\b", r"\1 micromolar", text)
 
-    # Read "224 × 224" as "224 by 224" and "3.4×" as "3.4 times"
-    text = re.sub(r"(\d+(?:\.\d+)?)\s*×\s*(\d+(?:\.\d+)?)", r"\1 by \2", text)
-    text = re.sub(r"(\d+(?:\.\d+)?)\s*×\b", r"\1 times", text)
+    # Read "224 × 224" or "128x128" as "by", and "3.4×" or "50x" as "times"
+    text = re.sub(r"(\d+(?:\.\d+)?)\s*[×x]\s*(\d+(?:\.\d+)?)\b", r"\1 by \2", text)
+    text = re.sub(r"(\d+(?:\.\d+)?)\s*[×x]\b", r"\1 times", text)
     text = text.replace("×", " times ")
 
     def _replace_unicode_sup(m: re.Match[str]) -> str:

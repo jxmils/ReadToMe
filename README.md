@@ -2,7 +2,7 @@
 
 A local tool that reads PDFs and text out loud, mainly built for research papers.
 
-Most PDF readers mess up two-column papers, read out every citation bracket, and either skip over figures or read random axis numbers as gibberish. ReadToMe fixes the reading order, crops out each figure as an image, and uses a small local vision model to tell you what the chart or diagram actually shows before moving on with the paper.
+Most PDF readers mess up multi-column papers, read out every citation bracket, and either skip over figures or read random axis numbers as gibberish. ReadToMe handles single-column, two-column, and three-column layouts (like arXiv, IEEE, Nature, and Communications of the ACM), crops out each figure and table, and uses a small local vision model to tell you what it actually shows before moving on with the paper.
 
 Everything runs locally on your own machine (Kokoro for speech and Qwen3-VL for figures). Nothing gets sent to external APIs.
 
@@ -42,8 +42,8 @@ The first time you run it, it downloads the voice files (~340 MB into `models/ko
 
 ## What it does
 
-- Reads two-column academic PDFs in the right order while ignoring headers, footers, and page numbers.
-- Pulls out both normal images and vector plots/diagrams, then explains what they show in plain English right after the paragraph that mentions them.
+- Reads 1-column, 2-column, and 3-column academic PDFs (including mixed-spanning figures, tables, and callout boxes) in the right order while ignoring headers, footers, and page numbers.
+- Pulls out figures and tables (both normal images and vector plots/diagrams, whether captions sit above or below), then explains what they show in plain English right after the paragraph that mentions them.
 - Cleans up inline citations like `[1, 4, 12]` and reads common math symbols (`α`, `3.4×`, `±`, `μs`) naturally.
 - Lets you type a follow-up question on any figure card and hear the answer read back.
 - Skips the bibliography by default unless you turn it on in the sidebar.
