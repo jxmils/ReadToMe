@@ -1,0 +1,24 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local AI models & runtime session data
+models/
+data/
+*.onnx
+*.bin
+*.wav
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
